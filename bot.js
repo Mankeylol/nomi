@@ -1,14 +1,18 @@
 require('dotenv').config();
+
 const { Telegraf } = require('telegraf');
 const { Markup } = require('telegraf');
-
 const { getUserWallet, createUserWallet } = require('./walletManager');
+
 const handleBalance = require('./features/balance');
 const handleSend = require('./features/send');
+const { sendMiddleware } = require('./features/send');
 const handleStake = require('./features/stake');
 const handleSwap = require('./features/swap');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+
+bot.use(sendMiddleware);
 
 bot.command('start', async (ctx) => {
   const userId = ctx.from.id.toString();
@@ -37,23 +41,23 @@ bot.action('balance', async (ctx) => {
   console.log('Balance action triggered');
   await handleBalance(ctx);
 });
+
 bot.action('send', async (ctx) => {
   await ctx.answerCbQuery();
   console.log('Send action triggered');
   await handleSend(ctx);
 });
+
 bot.action('swap', async (ctx) => {
   await ctx.answerCbQuery();
   console.log('Swap action triggered');
   await handleSwap(ctx);
 });
+
 bot.action('stake', async (ctx) => {
   await ctx.answerCbQuery();
   console.log('Stake action triggered');
   await handleStake(ctx);
 });
-
-
-
 
 bot.launch();
