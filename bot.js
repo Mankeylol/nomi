@@ -10,6 +10,19 @@ const handleSwap = require('./features/swap');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
+bot.telegram.setMyCommands([
+  { command: 'start', description: 'Start and create your wallet' },
+  { command: 'balance', description: 'Check your wallet balance' },
+  { command: 'send', description: 'Send tokens to another address' },
+  { command: 'swap', description: 'Swap tokens' },
+  { command: 'stake', description: 'Stake your tokens' }
+]);
+
+bot.command('balance', handleBalance);
+bot.command('send', handleSend);
+bot.command('swap', handleSwap);
+bot.command('stake', handleStake);
+
 bot.command('start', async (ctx) => {
   const userId = ctx.from.id.toString();
   let wallet = getUserWallet(userId);
