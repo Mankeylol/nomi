@@ -5,10 +5,13 @@ const { Markup } = require('telegraf');
 const { getUserWallet, createUserWallet } = require('./walletManager');
 const handleBalance = require('./features/balance');
 const handleSend = require('./features/send');
+const { sendMiddleware } = require('./features/send');
 const handleStake = require('./features/stake');
 const handleSwap = require('./features/swap');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+
+bot.use(sendMiddleware);
 
 bot.telegram.setMyCommands([
   { command: 'start', description: 'Start and create your wallet' },
