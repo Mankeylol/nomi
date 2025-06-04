@@ -1,219 +1,425 @@
 const { ApiPromise, WsProvider } = require('@polkadot/api');
 const { Keyring } = require('@polkadot/keyring');
 const { getUserWallet } = require('../walletManager');
+const { Markup } = require('telegraf');
 
-const pendingTransactions = new Map();
+// ROOT Network configuration
+const ROOT_NETWORK_ENDPOINT = 'wss://porcini.rootnet.app/ws';
+const DECIMAL_PLACES = 6; // ROOT token has 6 decimal places
 
+// Store user sessions for multi-step sending process
+const userSessions = new Map();
+
+// Middleware to handle multi-step sending process
+const sendMiddleware = (ctx, next) => {
+  const userId = ctx.from.id.toString();
+  const session = userSessions.get(userId);
+  
+  if (session && session.step && ctx.message && ctx.message.text && !ctx.message.text.startsWith('/')) {
+    handleSendStep(ctx, session);
+    return;
+  }
+  
+  return next();
+};
+
+// Main send handler
 async function handleSend(ctx) {
-    const userId = ctx.from.id;
-    const wallet = getUserWallet(userId.toString());
-   
+  const userId = ctx.from.id.toString();
+  
+  try {
+    // Clear any existing session
+    userSessions.delete(userId);
+    
+    // Check if user has a wallet
+    const wallet = getUserWallet(userId);
     if (!wallet) {
-        return ctx.reply("❌ No wallet found. Use /start first.");
+      await ctx.reply('❌ No wallet found. Please use /start to create a wallet first.');
+      return;
     }
 
-    pendingTransactions.set(userId, { step: 'await_address' });
+    // Initialize new sending session
+    userSessions.set(userId, {
+      step: 'recipient',
+      wallet: wallet
+    });
 
     await ctx.reply(
-        `📤 Send from: ${wallet.address}\n\n` +
-        'Please enter the recipient address:'
+      '📤 **Send ROOT Tokens**\n\n' +
+      'Please enter the recipient\'s ROOT address:\n\n' +
+      '💡 *Example: 0xD06101f623B17284A7Cd7F28dE6e3B29D2646be0*\n' +
+      '⚠️ *Make sure the address is valid and double-check before sending*',
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '❌ Cancel', callback_data: 'cancel_send' }
+          ]]
+        }
+      }
     );
+
+  } catch (error) {
+    console.error('Error in handleSend:', error);
+    await ctx.reply('❌ An error occurred while initializing the send process. Please try again.');
+    userSessions.delete(userId);
+  }
 }
 
-async function sendMiddleware(ctx, next) {
-    if (!ctx.message || !ctx.message.text) return next();
-   
-    const userId = ctx.from.id;
-    const pendingTx = pendingTransactions.get(userId);
-   
-    if (!pendingTx) return next();
+// Handle different steps of the sending process
+async function handleSendStep(ctx, session) {
+  const userId = ctx.from.id.toString();
+  const input = ctx.message.text.trim();
 
-    try {
-        const wallet = getUserWallet(userId.toString());
-        if (!wallet) {
-            pendingTransactions.delete(userId);
-            return ctx.reply("❌ Wallet not found. Use /start first.");
-        }
+  try {
+    switch (session.step) {
+      case 'recipient':
+        await handleRecipientInput(ctx, session, input);
+        break;
+      case 'amount':
+        await handleAmountInput(ctx, session, input);
+        break;
+      default:
+        userSessions.delete(userId);
+        await ctx.reply('❌ Invalid session state. Please start over with the send command.');
+    }
+  } catch (error) {
+    console.error('Error in handleSendStep:', error);
+    await ctx.reply('❌ An error occurred. Please try again.');
+    userSessions.delete(userId);
+  }
+}
 
-        if (pendingTx.step === 'await_address') {
-            const address = ctx.message.text.trim();
-           
-            if (!isValidAddress(address)) {
-                return ctx.reply("❌ Invalid address format. Please try again:");
-            }
+// Handle recipient address input
+async function handleRecipientInput(ctx, session, address) {
+  const userId = ctx.from.id.toString();
 
-            pendingTx.recipient = address;
-            pendingTx.step = 'await_amount';
-            pendingTransactions.set(userId, pendingTx);
 
-            return ctx.reply(
-                `Recipient: ${address}\n\n` +
-                'Please enter the amount to send (in ROOT):'
-            );
-        }
+  if (!isValidEthereumAddress(address)) {
+    await ctx.reply(
+      '❌ Invalid ROOT address format.\n\n' +
+      '✅ Valid format: 0x followed by 40 hexadecimal characters\n' +
+      '💡 Example: 0xD16101f623B17284AfCd7F28dE6e3B29D2646be0\n\n' +
+      'Please enter a valid ROOT address:'
+    );
+    return;
+  }
 
-        if (pendingTx.step === 'await_amount') {
-            const amount = parseFloat(ctx.message.text.trim());
-           
-            if (isNaN(amount) || amount <= 0) {
-                return ctx.reply("❌ Invalid amount. Please enter a positive number:");
-            }
+  // Update session
+  session.recipient = address;
+  session.step = 'amount';
+  userSessions.set(userId, session);
 
-            const amountInBaseUnits = Math.floor(amount * 1_000_000);
+  // Get current balance for reference
+  const balance = await getBalance(session.wallet.address);
+  const formattedBalance = formatTokenAmount(balance.free);
 
-            pendingTx.amount = amount;
-            pendingTx.amountInBaseUnits = amountInBaseUnits;
-            pendingTx.step = 'confirm';
-            pendingTransactions.set(userId, pendingTx);
+  await ctx.reply(
+    `✅ **Recipient Address Set**\n\n` +
+    `📬 **To:** \`${address}\`\n\n` +
+    `💰 **Your Balance:** ${formattedBalance} ROOT\n\n` +
+    `Please enter the amount to send (in ROOT):`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '💰 Send Max', callback_data: 'send_max' },
+            { text: '❌ Cancel', callback_data: 'cancel_send' }
+          ]
+        ]
+      }
+    }
+  );
+}
 
-            return ctx.reply(
-                `⚠️ Confirm Transaction:\n\n` +
-                `From: ${wallet.address}\n` +
-                `To: ${pendingTx.recipient}\n` +
-                `Amount: ${amount} ROOT\n\n` +
-                'Reply "confirm" to send or "cancel" to abort.',
-                { parse_mode: 'Markdown' }
-            );
-        }
+// Handle amount input
+async function handleAmountInput(ctx, session, amountStr) {
+  const userId = ctx.from.id.toString();
 
-        if (pendingTx.step === 'confirm') {
-            const response = ctx.message.text.trim().toLowerCase();
-           
-            if (response === 'confirm') {
-                await executeSend(ctx, userId, pendingTx);
-            } else if (response === 'cancel') {
-                pendingTransactions.delete(userId);
-                return ctx.reply("❌ Transaction cancelled.");
+  // Parse and validate amount
+  const amount = parseFloat(amountStr);
+  if (isNaN(amount) || amount <= 0) {
+    await ctx.reply('❌ Invalid amount. Please enter a valid positive number (e.g., 1.5 or 10):');
+    return;
+  }
+
+  // Convert to planck units (smallest unit)
+  const amountInPlanck = BigInt(Math.floor(amount * Math.pow(10, DECIMAL_PLACES)));
+  
+  // Check balance
+  const balance = await getBalance(session.wallet.address);
+  
+  if (amountInPlanck > balance.free) {
+    const formattedBalance = formatTokenAmount(balance.free);
+    await ctx.reply(
+      `❌ **Insufficient Balance**\n\n` +
+      `💰 **Available:** ${formattedBalance} ROOT\n` +
+      `📤 **Requested:** ${amount} ROOT\n\n` +
+      `Please enter a smaller amount:`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  // Update session and show confirmation
+  session.amount = amount;
+  session.amountInPlanck = amountInPlanck;
+  userSessions.set(userId, session);
+
+  // Calculate estimated fee
+  const estimatedFee = await estimateTransferFee(session.wallet.address, session.recipient, amountInPlanck);
+  const formattedFee = formatTokenAmount(estimatedFee);
+  const totalCost = amount + parseFloat(formattedFee);
+
+  await ctx.reply(
+    `🔍 **Transaction Summary**\n\n` +
+    `📬 **To:** \`${session.recipient}\`\n` +
+    `💸 **Amount:** ${amount} ROOT\n` +
+    `⛽ **Est. Fee:** ~${formattedFee} ROOT\n` +
+    `💰 **Total Cost:** ~${totalCost.toFixed(6)} ROOT\n\n` +
+    `❓ **Confirm this transaction?**`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '✅ Confirm & Send', callback_data: 'confirm_send' },
+            { text: '❌ Cancel', callback_data: 'cancel_send' }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+// Execute the actual transfer
+async function executeTransfer(ctx, session) {
+  const userId = ctx.from.id.toString();
+  let api;
+  
+  try {
+    await ctx.reply('⏳ Processing transaction...');
+
+    // Connect to ROOT network
+    const wsProvider = new WsProvider(ROOT_NETWORK_ENDPOINT);
+    api = await ApiPromise.create({ provider: wsProvider });
+
+    // Create keyring with ECDSA (Ethereum-compatible) for ROOT Network
+    const keyring = new Keyring({ type: 'ethereum' });
+    const senderPair = keyring.addFromUri(session.wallet.mnemonic);
+
+    // Create transfer extrinsic
+    const transfer = api.tx.balances.transfer(session.recipient, session.amountInPlanck.toString());
+
+    // Get payment info before sending
+    const paymentInfo = await transfer.paymentInfo(senderPair);
+    console.log(`Transaction fee: ${formatTokenAmount(paymentInfo.partialFee)} ROOT`);
+
+    // Sign and send transaction
+    const txHash = await new Promise((resolve, reject) => {
+      transfer.signAndSend(senderPair, ({ status, dispatchError, txHash }) => {
+        if (status.isInBlock) {
+          if (dispatchError) {
+            if (dispatchError.isModule) {
+              const decoded = api.registry.findMetaError(dispatchError.asModule);
+              const { section, name, docs } = decoded;
+              reject(new Error(`${section}.${name}: ${docs.join(' ')}`));
             } else {
-                return ctx.reply('Please reply "confirm" or "cancel":');
+              reject(new Error(dispatchError.toString()));
             }
+          } else {
+            resolve(txHash);
+          }
         }
+      }).catch(reject);
+    });
 
-    } catch (error) {
-        console.error('Send error:', error);
-        pendingTransactions.delete(userId);
-        ctx.reply(`❌ Error: ${error.message}`);
+    await ctx.reply(
+      `✅ **Transaction Sent Successfully!**\n\n` +
+      `📤 **Amount:** ${session.amount} ROOT\n` +
+      `📬 **To:** \`${session.recipient}\`\n` +
+      `🔗 **Transaction Hash:** \`${txHash.toHex()}\`\n\n` +
+      `⏰ *Transaction is being processed on the ROOT network...*\n` +
+      `🔍 *You can check the status on ROOT Network explorer*`,
+      { parse_mode: 'Markdown' }
+    );
+
+    // Monitor for finalization
+    monitorFinalization(ctx, api, txHash, session);
+
+    // Clean up session
+    userSessions.delete(userId);
+
+  } catch (error) {
+    console.error('Transfer execution error:', error);
+    let errorMessage = 'Transaction failed. ';
+    
+    if (error.message.includes('InsufficientBalance')) {
+      errorMessage += 'Insufficient balance to cover transaction and fees.';
+    } else if (error.message.includes('LiquidityRestrictions')) {
+      errorMessage += 'Account has liquidity restrictions.';
+    } else {
+      errorMessage += error.message;
     }
-
-    return next();
+    
+    await ctx.reply(
+      `❌ **Transaction Failed**\n\n` +
+      `${errorMessage}\n\n` +
+      `Please try again or contact support if the issue persists.`
+    );
+    userSessions.delete(userId);
+  } finally {
+    if (api) {
+      await api.disconnect();
+    }
+  }
 }
 
-async function executeSend(ctx, userId, txDetails) {
-    const wallet = getUserWallet(userId.toString());
-    if (!wallet) throw new Error('Wallet not found');
-
-    const provider = new WsProvider('wss://porcini.rootnet.app/archive/ws');
-    let api;
-
-    const processingMsg = await ctx.reply('⏳ Processing transaction...');
-
-    try {
-        api = await ApiPromise.create({ provider });
-
-        const keyring = new Keyring({ type: 'ethereum' });
-        const account = keyring.addFromUri(wallet.mnemonic);
+// Monitor transaction finalization
+async function monitorFinalization(ctx, api, txHash, session) {
+  try {
+    const unsubscribe = await api.rpc.chain.subscribeFinalizedHeads(async (header) => {
+      try {
+        const blockHash = header.hash;
+        const block = await api.rpc.chain.getBlock(blockHash);
         
-        console.log('Wallet address from getUserWallet:', wallet.address);
-        console.log('Account address from keyring:', account.address);
+        // Check if our transaction is in this finalized block
+        const found = block.block.extrinsics.find(ext => ext.hash.toHex() === txHash.toHex());
         
-        const actualAddress = account.address;
-
-        const { data: balance } = await api.query.system.account(actualAddress);
-        const availableBalance = balance.free.toBigInt();
-        
-        const transfer = api.tx.balances.transfer(
-            txDetails.recipient,
-            txDetails.amountInBaseUnits
-        );
-        
-        const paymentInfo = await transfer.paymentInfo(account);
-        const fee = paymentInfo.partialFee.toBigInt();
-        
-        console.log(`Available balance: ${availableBalance}`);
-        console.log(`Amount to send: ${txDetails.amountInBaseUnits}`);
-        console.log(`Estimated fee: ${fee}`);
-        console.log(`Total needed: ${BigInt(txDetails.amountInBaseUnits) + fee}`);
-        
-        if (availableBalance < BigInt(txDetails.amountInBaseUnits) + fee) {
-            const availableFormatted = Number(availableBalance) / 1_000_000;
-            const feeFormatted = Number(fee) / 1_000_000;
-            throw new Error(`Insufficient balance. Available: ${availableFormatted.toFixed(6)} ROOT, Amount: ${txDetails.amount} ROOT, Fee: ${feeFormatted.toFixed(6)} ROOT`);
-        }
-
-        const hash = await new Promise((resolve, reject) => {
-            let unsub;
-            
-            transfer.signAndSend(account, ({ status, dispatchError, events }) => {
-                console.log('Transaction status:', status.type);
-                
-                if (status.isInBlock) {
-                    console.log('Transaction included in block:', status.asInBlock.toString());
-                    
-                    if (dispatchError) {
-                        if (dispatchError.isModule) {
-                            const decoded = api.registry.findMetaError(dispatchError.asModule);
-                            const { docs, method, section } = decoded;
-                            reject(new Error(`${section}.${method}: ${docs.join(' ')}`));
-                        } else {
-                            reject(new Error(dispatchError.toString()));
-                        }
-                    } else {
-                        resolve(status.asInBlock.toString());
-                    }
-                    
-                    if (unsub) unsub();
-                } else if (status.isFinalized) {
-                    console.log('Transaction finalized:', status.asFinalized.toString());
-                    if (!dispatchError) {
-                        resolve(status.asFinalized.toString());
-                    }
-                    if (unsub) unsub();
-                } else if (status.isInvalid) {
-                    reject(new Error('Transaction is invalid'));
-                    if (unsub) unsub();
-                } else if (status.isDropped) {
-                    reject(new Error('Transaction was dropped'));
-                    if (unsub) unsub();
-                }
-            }).then(unsubFn => {
-                unsub = unsubFn;
-            }).catch(reject);
-        });
-
-        await ctx.telegram.editMessageText(
-            ctx.chat.id,
-            processingMsg.message_id,
-            null,
-            `✅ Transaction successful!\n\n` +
-            `Amount: ${txDetails.amount} ROOT\n` +
-            `From: ${wallet.address}\n` +
-            `To: ${txDetails.recipient}\n\n` +
-            `Hash: \`${hash}\`\n\n` +
-            `[View on explorer](https://porcini.rootscan.io/tx/${hash})`,
+        if (found) {
+          await ctx.reply(
+            `🎉 **Transaction Finalized!**\n\n` +
+            `✅ Your transfer of ${session.amount} ROOT has been confirmed and finalized.\n` +
+            `📦 **Block:** #${header.number}\n` +
+            `🔗 **Hash:** \`${txHash.toHex()}\`\n\n` +
+            `💫 *Transaction is now immutable on the ROOT Network!*`,
             { parse_mode: 'Markdown' }
-        );
-
-    } catch (error) {
-        console.error('Transaction error:', error);
-        await ctx.telegram.editMessageText(
-            ctx.chat.id,
-            processingMsg.message_id,
-            null,
-            `❌ Failed to send transaction:\n${error.message}`
-        );
-        throw error;
-    } finally {
-        if (api) {
-            await api.disconnect();
+          );
+          unsubscribe();
         }
-        pendingTransactions.delete(userId);
+      } catch (error) {
+        console.error('Error checking finalized block:', error);
+      }
+    });
+
+    // Auto-unsubscribe after 5 minutes
+    setTimeout(() => {
+      unsubscribe();
+    }, 300000);
+
+  } catch (error) {
+    console.error('Transaction monitoring error:', error);
+  }
+}
+
+// Get account balance using ROOT Network API
+async function getBalance(address) {
+  let api;
+  try {
+    const wsProvider = new WsProvider(ROOT_NETWORK_ENDPOINT);
+    api = await ApiPromise.create({ provider: wsProvider });
+    
+    const { data: balance } = await api.query.system.account(address);
+    return balance;
+  } catch (error) {
+    console.error('Balance query error:', error);
+    return { free: BigInt(0), reserved: BigInt(0), miscFrozen: BigInt(0), feeFrozen: BigInt(0) };
+  } finally {
+    if (api) {
+      await api.disconnect();
     }
+  }
 }
 
-function isValidAddress(address) {
-    return /^0x[a-fA-F0-9]{40}$/.test(address);
+// Estimate transfer fee using ROOT Network API
+async function estimateTransferFee(from, to, amount) {
+  let api;
+  try {
+    const wsProvider = new WsProvider(ROOT_NETWORK_ENDPOINT);
+    api = await ApiPromise.create({ provider: wsProvider });
+    
+    const transfer = api.tx.balances.transfer(to, amount.toString());
+    const info = await transfer.paymentInfo(from);
+    
+    return info.partialFee.toBigInt();
+  } catch (error) {
+    console.error('Fee estimation error:', error);
+    // Return default fee estimate (0.001 ROOT = 1000 planck units)
+    return BigInt(1000);
+  } finally {
+    if (api) {
+      await api.disconnect();
+    }
+  }
 }
 
+// Format token amount for display
+function formatTokenAmount(balance) {
+  const amount = BigInt(balance);
+  const divisor = BigInt(Math.pow(10, DECIMAL_PLACES));
+  const wholePart = amount / divisor;
+  const fractionalPart = amount % divisor;
+  
+  return `${wholePart}.${fractionalPart.toString().padStart(DECIMAL_PLACES, '0')}`;
+}
+
+// Validate Ethereum-style address (used by ROOT Network)
+function isValidEthereumAddress(address) {
+  // ROOT Network uses Ethereum-compatible addresses
+  // Format: 0x followed by 40 hexadecimal characters (case insensitive)
+  const ethereumAddressRegex = /^0x[a-fA-F0-9]{40}$/;
+  return ethereumAddressRegex.test(address);
+}
+
+// Handle callback queries for send operations
+async function handleSendCallbacks(ctx) {
+  const userId = ctx.from.id.toString();
+  const session = userSessions.get(userId);
+
+  if (!session) {
+    await ctx.answerCbQuery('Session expired. Please start over.');
+    return;
+  }
+
+  switch (ctx.callbackQuery.data) {
+    case 'send_max':
+      try {
+        const balance = await getBalance(session.wallet.address);
+        const estimatedFee = await estimateTransferFee(session.wallet.address, session.recipient, balance.free);
+        const maxAmountInPlanck = balance.free - estimatedFee;
+        
+        if (maxAmountInPlanck <= 0n) {
+          await ctx.answerCbQuery('Insufficient balance for transaction fees.');
+          return;
+        }
+        
+        const maxAmount = Number(maxAmountInPlanck) / Math.pow(10, DECIMAL_PLACES);
+        await handleAmountInput(ctx, session, maxAmount.toFixed(6));
+        await ctx.answerCbQuery();
+      } catch (error) {
+        console.error('Send max error:', error);
+        await ctx.answerCbQuery('Error calculating maximum amount.');
+      }
+      break;
+
+    case 'confirm_send':
+      await ctx.answerCbQuery();
+      await executeTransfer(ctx, session);
+      break;
+
+    case 'cancel_send':
+      userSessions.delete(userId);
+      await ctx.answerCbQuery();
+      await ctx.reply('❌ Send operation cancelled.');
+      break;
+
+    default:
+      await ctx.answerCbQuery('Unknown action.');
+  }
+}
+
+// Export functions
 module.exports = handleSend;
-
 module.exports.sendMiddleware = sendMiddleware;
+module.exports.handleSendCallbacks = handleSendCallbacks;
