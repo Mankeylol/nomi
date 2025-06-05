@@ -45,8 +45,8 @@ A Telegram bot for managing tokens, staking, and DeFi interactions on RootNetwor
 1. Clone the repo:
 
 ```bash
-git clone https://github.com/yourname/rootnetwork-tg-bot.git
-cd rootnetwork-tg-bot
+git clone https://github.com/Mankeylol/nomi.git
+cd nomi
 ```
 
 2. Install dependencies:
