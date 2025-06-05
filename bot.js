@@ -8,10 +8,12 @@ const handleSend = require('./features/send');
 const { sendMiddleware } = require('./features/send');
 const handleStake = require('./features/stake');
 const handleSwap = require('./features/swap');
+const { stakeMiddleware, handleStake, executeStake } = require('./features/stake');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 bot.use(sendMiddleware);
+bot.use(stakeMiddleware);
 
 bot.telegram.setMyCommands([
   { command: 'start', description: 'Start and create your wallet' },
@@ -68,6 +70,17 @@ bot.action('stake', async (ctx) => {
   console.log('Stake action triggered');
   await handleStake(ctx);
 });
+
+  bot.action('confirm_stake', async (ctx) => {
+    await ctx.answerCbQuery();
+    await executeStake(ctx);
+  });
+  
+bot.action('cancel_stake', async (ctx) => {
+  await ctx.answerCbQuery();
+  await handleStakeCancel(ctx);
+});
+
 
 
 
