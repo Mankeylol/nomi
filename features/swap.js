@@ -1,66 +1,117 @@
-require('dotenv').config();
+const { ApiPromise, WsProvider, Keyring } = require('@polkadot/api');
+const { getUserWallet } = require('../walletManager');
 
-const { Telegraf } = require('telegraf');
-const { Markup } = require('telegraf');
-const { getUserWallet, createUserWallet } = require('./walletManager');
+const ROOT_RPC = 'wss://porcini.rootnet.app/archive/ws';
+const DECIMALS = 6;
 
-const handleBalance = require('./features/balance');
-const handleSend = require('./features/send');
-const { sendMiddleware } = require('./features/send');
-const handleSwap = require('./features/swap');
-const { swapMiddleware } = require('./features/swap');
-const handleStake = require('./features/stake');
+const swapSessions = new Map();
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const ASSET_OPTIONS = {
+  ROOT: 1,
+  XRP: 2,
+  ASTO: 17508,
+  SYLO: 3172,
+};
 
-// Add the send middleware to handle multi-step sending
-bot.use(sendMiddleware);
-bot.use(swapMiddleware);
+const ASSET_LIST_MESSAGE = Object.entries(ASSET_OPTIONS)
+  .map(([name, id]) => `${name} - ${id}`)
+  .join('\n');
 
-bot.command('start', async (ctx) => {
+async function handleSwap(ctx) {
   const userId = ctx.from.id.toString();
-  let wallet = getUserWallet(userId);
+  const wallet = getUserWallet(userId);
 
-  if (!wallet) {
-    wallet = createUserWallet(userId);
-    await ctx.reply(`🆕 New wallet created:\n${wallet.address}`);
-  } else {
-    await ctx.reply(`💼 Existing wallet:\n${wallet.address}`);
+  if (!wallet) return ctx.reply("❌ No wallet found. Use /start first.");
+
+  swapSessions.set(userId, { step: 'assetIn', wallet });
+  return ctx.reply(`💱 Choose the *token to swap from* (asset A):\n\n${ASSET_LIST_MESSAGE}`, { parse_mode: 'Markdown' });
+}
+
+async function swapMiddleware(ctx, next) {
+  const userId = ctx.from.id.toString();
+  const session = swapSessions.get(userId);
+  const msg = ctx.message?.text;
+
+  if (!session || !msg || msg.startsWith('/')) return next();
+
+  try {
+    switch (session.step) {
+      case 'assetIn':
+        session.assetIn = parseInt(msg);
+        if (!Object.values(ASSET_OPTIONS).includes(session.assetIn))
+          return ctx.reply('❌ Invalid asset ID. Choose from:\n' + ASSET_LIST_MESSAGE);
+        session.step = 'amount';
+        return ctx.reply("🔢 Enter the amount of asset A to swap:");
+
+      case 'amount':
+        const amount = parseFloat(msg);
+        if (isNaN(amount) || amount <= 0) return ctx.reply('❌ Invalid amount.');
+        session.amount = amount;
+        session.amountRaw = BigInt(amount * 10 ** DECIMALS);
+        session.step = 'assetOut';
+        return ctx.reply(`💱 Choose the *token to receive* (asset B):\n\n${ASSET_LIST_MESSAGE}`, { parse_mode: 'Markdown' });
+
+      case 'assetOut':
+        session.assetOut = parseInt(msg);
+        if (!Object.values(ASSET_OPTIONS).includes(session.assetOut))
+          return ctx.reply('❌ Invalid asset ID. Choose from:\n' + ASSET_LIST_MESSAGE);
+        session.step = 'confirm';
+        swapSessions.set(userId, session);
+        return ctx.reply(
+          `🔁 Confirm Swap:\n\n` +
+          `Swap ${session.amount} units\n` +
+          `From asset #${session.assetIn} → To asset #${session.assetOut}\n\n` +
+          `Reply with "confirm" or "cancel"`
+        );
+
+      case 'confirm':
+        if (msg.toLowerCase() === 'confirm') {
+          await executeSwap(ctx, session);
+          swapSessions.delete(userId);
+        } else {
+          ctx.reply('❌ Swap cancelled.');
+          swapSessions.delete(userId);
+        }
+        break;
+    }
+  } catch (err) {
+    console.error('Swap error:', err);
+    ctx.reply(`❌ Swap failed: ${err.message}`);
+    swapSessions.delete(userId);
   }
 
-  await ctx.reply(
-    'Choose an action:',
-    Markup.inlineKeyboard([
-      [Markup.button.callback('💰 Balance', 'balance')],
-      [Markup.button.callback('📤 Send', 'send')],
-      [Markup.button.callback('🔄 Swap', 'swap')],
-      [Markup.button.callback('📥 Stake', 'stake')],
-    ])
+  return next();
+}
+
+async function executeSwap(ctx, session) {
+  const { wallet, amountRaw, assetIn, assetOut } = session;
+
+  const api = await ApiPromise.create({ provider: new WsProvider(ROOT_RPC) });
+  const keyring = new Keyring({ type: 'ethereum' });
+  const sender = keyring.addFromUri(wallet.mnemonic);
+
+  const amountOutMin = BigInt(amountRaw * 95n / 100n); // 5% slippage
+  const path = [assetIn, assetOut];
+  const to = sender.address;
+  const deadline = Math.floor(Date.now() / 1000) + 600;
+
+  const tx = api.tx.dex.swapWithExactSupply(
+    amountRaw,
+    amountOutMin,
+    path,
+    to,
+    deadline
   );
-});
 
-bot.action('balance', async (ctx) => {
-  await ctx.answerCbQuery();
-  console.log('Balance action triggered');
-  await handleBalance(ctx);
-});
+  await ctx.reply('⏳ Sending swap transaction...');
+  const unsub = await tx.signAndSend(sender, ({ status }) => {
+    if (status.isInBlock) {
+      ctx.reply(`✅ Swap included in block: ${status.asInBlock}`);
+      unsub();
+      api.disconnect();
+    }
+  });
+}
 
-bot.action('send', async (ctx) => {
-  await ctx.answerCbQuery();
-  console.log('Send action triggered');
-  await handleSend(ctx);
-});
-
-bot.action('swap', async (ctx) => {
-  await ctx.answerCbQuery();
-  console.log('Swap action triggered');
-  await handleSwap(ctx);
-});
-
-bot.action('stake', async (ctx) => {
-  await ctx.answerCbQuery();
-  console.log('Stake action triggered');
-  await handleStake(ctx);
-});
-
-bot.launch();
+module.exports = handleSwap;
+module.exports.swapMiddleware = swapMiddleware;
