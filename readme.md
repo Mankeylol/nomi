@@ -1,4 +1,4 @@
-# RootNetwork Telegram Bot
+# TRN Engine
 
 A Telegram bot for managing tokens, staking, and DeFi interactions on RootNetwork. Built using Node.js and the Telegraf framework, the bot supports:
 
