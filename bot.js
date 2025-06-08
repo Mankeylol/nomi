@@ -69,4 +69,5 @@ bot.action('stake', async (ctx) => {
 });
 
 // 🚀 Start bot
+bot.launch();
 
